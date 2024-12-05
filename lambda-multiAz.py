@@ -1,53 +1,73 @@
 import json
 import urllib3
 
-
-def extract_resource_types(template):
+def extract_property_from_template(template, resource_type, property_name):
     """
-    Extrae los tipos de recursos (Type) del template.
-
-    Args:
-        template (str): El template de CloudFormation en formato YAML o JSON.
-
-    Returns:
-        list: Lista de tipos de recursos encontrados.
-    """
-    resource_types = []
-    resources = template.get("Resources", {})
-    for resource in resources.values():
-        if "Type" in resource:
-            resource_types.append(resource["Type"])
-    return resource_types
-
-
-def evaluate_compliance(resource):
-    """
-    Evalúa la conformidad de una Lambda Function basada en la configuración VPC.
-
-    Args:
-        resource (dict): Propiedades de la función Lambda.
-
-    Returns:
-        tuple: (bool, str) Estado de cumplimiento y mensaje asociado.
-    """
-    properties = resource.get("Properties", {})
+    Extrae una propiedad específica de un recurso en un template CloudFormation en formato string.
     
-    # Si no tiene configuración VPC, retorna True con mensaje
-    if "VpcConfig" not in properties:
+    :param template: String del template CloudFormation.
+    :param resource_type: Tipo del recurso a buscar (e.g., "AWS::Lambda::Function").
+    :param property_name: Nombre de la propiedad a extraer (e.g., "VpcConfig").
+    :return: Valor de la propiedad (e.g., dict, list, o None si no se encuentra).
+    """
+    lines = template.splitlines()
+    inside_resource = False
+    inside_target_resource = False
+    property_value = None
+    indentation_level = 0
+
+    for line in lines:
+        stripped_line = line.strip()
+
+        # Detectar el inicio del recurso
+        if stripped_line.startswith("Type:") and resource_type in stripped_line:
+            inside_resource = True
+            inside_target_resource = True
+            continue
+
+        # Salir del recurso si detectamos el final del bloque
+        if inside_resource and not stripped_line.startswith(" " * indentation_level):
+            inside_resource = False
+            inside_target_resource = False
+
+        # Buscar la propiedad dentro del recurso
+        if inside_target_resource and stripped_line.startswith(f"{property_name}:"):
+            property_value = stripped_line.split(":", 1)[1].strip()
+            if property_value == "|":
+                # Manejo de propiedades multilínea (YAML literal block)
+                property_value = []
+                indentation_level = line.index("|") + 1
+                continue
+            break
+
+    return property_value
+
+def evaluate_compliance(template, resource_type, property_name):
+    """
+    Evalúa la conformidad de un recurso con base en la cantidad de elementos en una propiedad.
+    
+    :param template: String del template CloudFormation.
+    :param resource_type: Tipo del recurso a buscar (e.g., "AWS::Lambda::Function").
+    :param property_name: Nombre de la propiedad a validar (e.g., "VpcConfig").
+    :return: Tuple (is_compliant: bool, message: str)
+    """
+    vpc_config = extract_property_from_template(template, resource_type, property_name)
+    if not vpc_config:
         return True, "Nothing to evaluate"
     
-    # Verifica si SubnetIds tiene al menos 2 elementos
-    subnet_ids = properties.get("VpcConfig", {}).get("SubnetIds", [])
-    if len(subnet_ids) >= 2:
-        return True, "Lambda function is compliant"
-    
-    return False, "Lambda function is non-compliant: SubnetIds must have at least 2 elements"
-
+    # Manejo para extraer SubnetIds de la propiedad VpcConfig si existe
+    if "SubnetIds" in vpc_config:
+        subnet_ids = vpc_config["SubnetIds"]
+        if len(subnet_ids) >= 2:
+            return True, "Compliance validated: At least two SubnetIds defined"
+        else:
+            return False, "Non-compliance: Less than two SubnetIds defined"
+    return False, "Non-compliance: Missing SubnetIds in VpcConfig"
 
 def lambda_handler(event, context):
     print("Event", event)
-    payload = event.get("requestData", {}).get("payload")
-    print("Payload URL:", payload)
+    payload_url = event.get("requestData", {}).get("payload")
+    print("Payload URL", payload_url)
 
     response = {
         "hookStatus": "SUCCESS",
@@ -56,33 +76,22 @@ def lambda_handler(event, context):
     }
 
     try:
-        # Descargar el template desde el payload URL
+        # Descargar el payload del template
         http = urllib3.PoolManager()
-        template_request = http.request("GET", payload)
-        print(f"Status Code: {template_request.status}")
-        template = json.loads(template_request.data.decode("utf-8"))
-        print("Template:", template)
+        template_hook_payload_request = http.request("GET", payload_url)
+        print(f"Status Code: {template_hook_payload_request.status}")
+        template = template_hook_payload_request.data.decode("utf-8")
+        print(f"Template: {template}")
 
-        # Extraer tipos de recursos y buscar Lambda Function
-        resource_types = extract_resource_types(template)
-        print("Resource Types:", resource_types)
+        # Validar cumplimiento
+        is_compliant, message = evaluate_compliance(template, "AWS::Lambda::Function", "VpcConfig")
+        response["message"] = message
+        if not is_compliant:
+            response["hookStatus"] = "FAILED"
+            response["errorCode"] = "NonCompliant"
 
-        if "AWS::Lambda::Function" in resource_types:
-            # Busca la Lambda Function en los recursos
-            resources = template.get("Resources", {})
-            for name, resource in resources.items():
-                if resource.get("Type") == "AWS::Lambda::Function":
-                    # Evaluar conformidad de la función Lambda
-                    is_compliant, message = evaluate_compliance(resource)
-                    if not is_compliant:
-                        response["hookStatus"] = "FAILED"
-                        response["message"] = message
-                        response["errorCode"] = "NonCompliant"
-                    else:
-                        response["message"] = message
-                    break
     except Exception as error:
-        print("Error:", error)
+        print(f"Error: {error}")
         response["hookStatus"] = "FAILED"
         response["message"] = "Failed to evaluate stack operation."
         response["errorCode"] = "InternalFailure"
